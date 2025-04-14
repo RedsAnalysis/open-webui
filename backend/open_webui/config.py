@@ -2572,6 +2572,18 @@ AUDIO_TTS_OPENAI_API_KEY = PersistentConfig(
     os.getenv("AUDIO_TTS_OPENAI_API_KEY", OPENAI_API_KEY),
 )
 
+# Added by RED: Custom TTS OpenAPI config definitions
+CUSTOMTTS_OPENAPI_BASE_URL = PersistentConfig(
+    "CUSTOMTTS_OPENAPI_BASE_URL",                 # Environment variable name
+    "audio.tts.custom_openapi.base_url",          # Unique path in DB config JSON
+    os.getenv("CUSTOMTTS_OPENAPI_BASE_URL", ""),  # Default value (empty string)
+)
+CUSTOMTTS_OPENAPI_KEY = PersistentConfig(
+    "CUSTOMTTS_OPENAPI_KEY",                      # Environment variable name
+    "audio.tts.custom_openapi.key",               # Unique path in DB config JSON
+    os.getenv("CUSTOMTTS_OPENAPI_KEY", ""),       # Default value (empty string)
+)
+
 AUDIO_TTS_API_KEY = PersistentConfig(
     "AUDIO_TTS_API_KEY",
     "audio.tts.api_key",

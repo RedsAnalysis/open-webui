@@ -131,6 +131,10 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
 class TTSConfigForm(BaseModel):
     OPENAI_API_BASE_URL: str
     OPENAI_API_KEY: str
+    # Added by RED: Configuration fields for CustomTTS OpenAPI compatible endpoint
+    CUSTOMTTS_OPENAPI_BASE_URL: str = "" # Add default empty string
+    CUSTOMTTS_OPENAPI_KEY: str = ""    # Add default empty string
+
     API_KEY: str
     ENGINE: str
     MODEL: str
@@ -163,6 +167,10 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
         "tts": {
             "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
+            # Added by RED: Return CustomTTS OpenAPI config
+            "CUSTOMTTS_OPENAPI_BASE_URL": getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', ''),
+            "CUSTOMTTS_OPENAPI_KEY": getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', ''),
+
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
@@ -191,6 +199,10 @@ async def update_audio_config(
 ):
     request.app.state.config.TTS_OPENAI_API_BASE_URL = form_data.tts.OPENAI_API_BASE_URL
     request.app.state.config.TTS_OPENAI_API_KEY = form_data.tts.OPENAI_API_KEY
+    # Added by RED: Update CustomTTS OpenAPI config
+    request.app.state.config.CUSTOMTTS_OPENAPI_BASE_URL = form_data.tts.CUSTOMTTS_OPENAPI_BASE_URL
+    request.app.state.config.CUSTOMTTS_OPENAPI_KEY = form_data.tts.CUSTOMTTS_OPENAPI_KEY
+
     request.app.state.config.TTS_API_KEY = form_data.tts.API_KEY
     request.app.state.config.TTS_ENGINE = form_data.tts.ENGINE
     request.app.state.config.TTS_MODEL = form_data.tts.MODEL
@@ -220,6 +232,10 @@ async def update_audio_config(
         "tts": {
             "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
+            # Added by RED: Return updated CustomTTS OpenAPI config
+            "CUSTOMTTS_OPENAPI_BASE_URL": getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', ''),
+            "CUSTOMTTS_OPENAPI_KEY": getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', ''),
+
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
@@ -333,6 +349,117 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                 status_code=getattr(r, "status", 500) if r else 500,
                 detail=detail if detail else "Open WebUI: Server Connection Error",
             )
+
+        # Added by RED: Logic for customTTS_openapi engine
+    elif request.app.state.config.TTS_ENGINE == "customTTS_openapi":
+        # Use the model specified in the request payload if provided, otherwise use the configured default
+        # Ensure payload exists before accessing it
+        if payload and "model" not in payload:
+             payload["model"] = request.app.state.config.TTS_MODEL
+
+        # Safely get custom URL and Key from config
+        custom_tts_url = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
+        custom_tts_key = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', None)
+
+        # Check if the URL is configured
+        if not custom_tts_url:
+             log.error("CustomTTS OpenAPI URL not configured.")
+             raise HTTPException(status_code=500, detail="CustomTTS OpenAPI URL not configured.")
+
+        # Construct the full endpoint URL, ensuring no double slashes
+        speech_endpoint_url = f"{custom_tts_url.rstrip('/')}/audio/speech"
+        log.info(f"Attempting to contact CustomTTS OpenAPI endpoint: {speech_endpoint_url}")
+
+        r = None # Initialize response variable for error handling
+        try:
+            timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=True # trust_env=True respects system proxy settings
+            ) as session:
+                # Prepare headers, including Authorization if key exists
+                headers = {
+                    "Content-Type": "application/json",
+                    **( {"Authorization": f"Bearer {custom_tts_key}"} if custom_tts_key else {} ), # Add Auth header only if key is present
+                    **(
+                        { # Forward user info headers if enabled
+                            "X-OpenWebUI-User-Name": user.name,
+                            "X-OpenWebUI-User-Id": user.id,
+                            "X-OpenWebUI-User-Email": user.email,
+                            "X-OpenWebUI-User-Role": user.role,
+                        }
+                        if ENABLE_FORWARD_USER_INFO_HEADERS
+                        else {}
+                    ),
+                }
+                log.debug(f"CustomTTS Request Headers: { {k: (v[:10] + '...' if k == 'Authorization' and v else v) for k, v in headers.items()} }") # Log headers safely
+                log.debug(f"CustomTTS Request Payload: {payload}")
+
+                # Make the POST request
+                async with session.post(
+                    url=speech_endpoint_url,
+                    json=payload, # Send the parsed JSON payload from the request body
+                    headers=headers,
+                ) as r:
+                    log.debug(f"CustomTTS Response Status: {r.status}")
+                    # Raise HTTP errors (4xx, 5xx)
+                    r.raise_for_status()
+
+                    # Save the received audio file
+                    async with aiofiles.open(file_path, "wb") as f:
+                        await f.write(await r.read())
+                    log.info(f"Saved CustomTTS audio response to cache: {file_path}")
+
+                    # Save the request payload for caching/debugging purposes (optional but good practice)
+                    async with aiofiles.open(file_body_path, "w") as f:
+                        await f.write(json.dumps(payload))
+
+            # If successful, return the cached audio file
+            return FileResponse(file_path)
+
+        # Handle exceptions during the request or response processing
+        except Exception as e:
+            log.exception(f"Error contacting or processing response from customTTS_openapi endpoint ({speech_endpoint_url}): {e}")
+            detail = None
+
+            # Attempt to get more specific error details from the response if available
+            try:
+                if r is not None and r.status != 200:
+                    # Try parsing standard error structures first
+                    try:
+                        res = await r.json()
+                        if isinstance(res, dict):
+                             if "error" in res: # OpenAI-like structure
+                                 error_content = res['error']
+                                 if isinstance(error_content, dict):
+                                     detail = f"External CustomTTS: {error_content.get('message', 'Unknown error')}"
+                                 else: # If error is just a string
+                                     detail = f"External CustomTTS: {error_content}"
+                             elif "detail" in res: # FastAPI-like structure
+                                 detail = f"External CustomTTS: {res.get('detail', 'Unknown error')}"
+                             else: # Fallback if structure is unknown but is JSON
+                                 detail = f"External CustomTTS Error (Status {r.status}): {str(res)[:200]}"
+                        else: # If response is JSON but not a dict
+                             detail = f"External CustomTTS Error (Status {r.status}): {str(res)[:200]}"
+
+                    except (json.JSONDecodeError, aiohttp.ClientResponseError):
+                         # If response is not JSON or other response error
+                         try:
+                             error_text = await r.text()
+                             detail = f"External CustomTTS Error (Status {r.status}): {error_text[:200]}" # Limit response text
+                         except Exception as text_exc:
+                             log.error(f"Could not read error text from CustomTTS response: {text_exc}")
+                             detail = f"External CustomTTS Error (Status {r.status}): Could not read response body."
+            except Exception as parse_exc:
+                # If reading/parsing the error response itself fails
+                log.error(f"Could not parse error response from customTTS_openapi: {parse_exc}")
+                detail = f"External CustomTTS Error: {e}" # Use original exception message
+
+            # Raise the final HTTP exception to the client
+            raise HTTPException(
+                status_code=getattr(r, "status", 500) if r is not None else 500, # Use response status code if available
+                detail=detail if detail else f"Open WebUI: CustomTTS Server Connection Error ({e.__class__.__name__})",
+            )
+    # End Added by RED block
 
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
         voice_id = payload.get("voice", "")
@@ -837,6 +964,59 @@ def get_available_models(request: Request) -> list[dict]:
                 available_models = [{"id": "tts-1"}, {"id": "tts-1-hd"}]
         else:
             available_models = [{"id": "tts-1"}, {"id": "tts-1-hd"}]
+
+    # Added by RED: Logic for customTTS_openapi models
+    elif request.app.state.config.TTS_ENGINE == "customTTS_openapi":
+        # Safely get custom URL and Key from config
+        custom_base_url = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
+        custom_api_key = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', None)
+        # Provide a default model list if fetching fails or URL not set
+        default_custom_models = [{"id": "default-custom-model"}] # You can customize this default
+
+        if custom_base_url:
+            # Assume an endpoint like /audio/models exists, matching frontend assumptions
+            models_url = f"{custom_base_url.rstrip('/')}/audio/models"
+            try:
+                log.debug(f"Attempting to fetch models from customTTS_openapi endpoint: {models_url}")
+                # Prepare headers, including Authorization if key exists
+                headers = {"Authorization": f"Bearer {custom_api_key}"} if custom_api_key else {}
+                # Use requests library for synchronous call here (suitable for config endpoints)
+                response = requests.get(models_url, headers=headers, timeout=5) # 5 second timeout
+                response.raise_for_status() # Raise HTTP errors
+                data = response.json()
+
+                # Check for expected format [{ "id": "model_id", "name": "Optional Name" }] or [{"id": "model_id"}]
+                # The frontend expects a list of dicts, potentially with 'id' and 'name'
+                if isinstance(data, dict) and "models" in data and isinstance(data["models"], list):
+                     available_models = data["models"]
+                     # Ensure format matches [{id: model_id, name: optional_name}]
+                     available_models = [{"id": m.get("id"), "name": m.get("name", m.get("id"))} for m in available_models if m.get("id")]
+                     log.info(f"Loaded {len(available_models)} models from {models_url}")
+                elif isinstance(data, list): # Handle if the endpoint returns just a list of model dicts
+                     available_models = data
+                     available_models = [{"id": m.get("id"), "name": m.get("name", m.get("id"))} for m in available_models if m.get("id")]
+                     log.info(f"Loaded {len(available_models)} models from {models_url}")
+                else:
+                     log.warning(f"Unrecognized model list format from {models_url}. Using default.")
+                     available_models = default_custom_models
+
+                # Filter out any models without an ID after parsing
+                available_models = [m for m in available_models if m.get("id")]
+                if not available_models: # If parsing resulted in empty list
+                    log.warning(f"Model list from {models_url} was empty or invalid after parsing. Using default.")
+                    available_models = default_custom_models
+
+            except requests.RequestException as e:
+                log.error(f"Error fetching models from {models_url}: {str(e)}. Using default.")
+                available_models = default_custom_models
+            except Exception as e:
+                log.error(f"Unexpected error processing models from {models_url}: {str(e)}. Using default.")
+                available_models = default_custom_models
+        else:
+             log.warning("CUSTOMTTS_OPENAPI_BASE_URL not configured for model fetching. Using default model.")
+             available_models = default_custom_models
+    # End Added by RED block
+
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
         try:
             response = requests.get(
@@ -898,6 +1078,51 @@ def get_available_voices(request) -> dict:
                 "nova": "nova",
                 "shimmer": "shimmer",
             }
+    # Added by RED: Logic for customTTS_openapi voices
+    elif request.app.state.config.TTS_ENGINE == "customTTS_openapi":
+        # Safely get custom URL and Key from config
+        custom_base_url = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
+        custom_api_key = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', None)
+        # Default voice map if fetch fails or URL not set
+        default_custom_voices = {"default-voice": "Default Custom Voice"} # Customize as needed
+
+        if custom_base_url:
+            # Assume an endpoint like /audio/voices exists, matching frontend assumptions
+            voices_url = f"{custom_base_url.rstrip('/')}/audio/voices"
+            try:
+                log.debug(f"Attempting to fetch voices from customTTS_openapi endpoint: {voices_url}")
+                # Prepare headers, including Authorization if key exists
+                headers = {"Authorization": f"Bearer {custom_api_key}"} if custom_api_key else {}
+                # Use requests library for synchronous call
+                response = requests.get(voices_url, headers=headers, timeout=5) # 5 second timeout
+                response.raise_for_status() # Raise HTTP errors
+                data = response.json()
+
+                 # Expecting format like {"voices": [{"id": "vid", "name": "vname"}, ...]}
+                 # Need to convert this list into a {id: name} dictionary
+                if isinstance(data, dict) and "voices" in data and isinstance(data["voices"], list):
+                    voices_list = data["voices"]
+                    # Create the {id: name} mapping
+                    available_voices = {voice.get("id"): voice.get("name", voice.get("id")) for voice in voices_list if voice.get("id")}
+                    if not available_voices: # Handle empty list response
+                         log.warning(f"Empty voice list received from {voices_url}. Using default.")
+                         available_voices = default_custom_voices
+                    else:
+                         log.info(f"Loaded {len(available_voices)} voices from {voices_url}")
+                else:
+                     log.warning(f"Unrecognized voice list format from {voices_url}. Using default.")
+                     available_voices = default_custom_voices
+            except requests.RequestException as e:
+                log.error(f"Error fetching voices from {voices_url}: {str(e)}. Using default.")
+                available_voices = default_custom_voices
+            except Exception as e:
+                log.error(f"Unexpected error processing voices from {voices_url}: {str(e)}. Using default.")
+                available_voices = default_custom_voices
+        else:
+             log.warning("CUSTOMTTS_OPENAPI_BASE_URL not configured for voice fetching. Using default voice.")
+             available_voices = default_custom_voices
+    # End Added by RED block
+
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
         try:
             available_voices = get_elevenlabs_voices(
