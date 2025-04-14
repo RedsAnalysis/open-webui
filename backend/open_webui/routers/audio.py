@@ -974,8 +974,8 @@ def get_available_models(request: Request) -> list[dict]:
         default_custom_models = [{"id": "default-custom-model"}] # You can customize this default
 
         if custom_base_url:
-            # Assume an endpoint like /audio/models exists, matching frontend assumptions
-            models_url = f"{custom_base_url.rstrip('/')}/audio/models"
+            # MODIFIED by RED: Use the correct models endpoint path from user curl example
+            models_url = f"{custom_base_url.rstrip('/')}/models"
             try:
                 log.debug(f"Attempting to fetch models from customTTS_openapi endpoint: {models_url}")
                 # Prepare headers, including Authorization if key exists
@@ -985,19 +985,16 @@ def get_available_models(request: Request) -> list[dict]:
                 response.raise_for_status() # Raise HTTP errors
                 data = response.json()
 
-                # Check for expected format [{ "id": "model_id", "name": "Optional Name" }] or [{"id": "model_id"}]
+                # MODIFIED BY RED: Check for the OpenAPI /v1/models format {"data": [...]}
                 # The frontend expects a list of dicts, potentially with 'id' and 'name'
-                if isinstance(data, dict) and "models" in data and isinstance(data["models"], list):
-                     available_models = data["models"]
+                if isinstance(data, dict) and "data" in data and isinstance(data["data"], list): # Look for "data" key
+                     model_list = data["data"] # Get the list from the "data" key
                      # Ensure format matches [{id: model_id, name: optional_name}]
-                     available_models = [{"id": m.get("id"), "name": m.get("name", m.get("id"))} for m in available_models if m.get("id")]
-                     log.info(f"Loaded {len(available_models)} models from {models_url}")
-                elif isinstance(data, list): # Handle if the endpoint returns just a list of model dicts
-                     available_models = data
-                     available_models = [{"id": m.get("id"), "name": m.get("name", m.get("id"))} for m in available_models if m.get("id")]
+                     # Use the model 'id' as the name if 'name' isn't present
+                     available_models = [{"id": m.get("id"), "name": m.get("id")} for m in model_list if m.get("id")] # Extract id, use id as name
                      log.info(f"Loaded {len(available_models)} models from {models_url}")
                 else:
-                     log.warning(f"Unrecognized model list format from {models_url}. Using default.")
+                     log.warning(f"Unrecognized model list format from {models_url} (expected '{{data: [...]}}'). Using default.") # Updated warning message
                      available_models = default_custom_models
 
                 # Filter out any models without an ID after parsing
@@ -1078,7 +1075,7 @@ def get_available_voices(request) -> dict:
                 "nova": "nova",
                 "shimmer": "shimmer",
             }
-    # Added by RED: Logic for customTTS_openapi voices
+        # Added by RED: Logic for customTTS_openapi voices
     elif request.app.state.config.TTS_ENGINE == "customTTS_openapi":
         # Safely get custom URL and Key from config
         custom_base_url = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
@@ -1087,8 +1084,9 @@ def get_available_voices(request) -> dict:
         default_custom_voices = {"default-voice": "Default Custom Voice"} # Customize as needed
 
         if custom_base_url:
-            # Assume an endpoint like /audio/voices exists, matching frontend assumptions
+            # MODIFIED BY RED: Target /audio/voices.
             voices_url = f"{custom_base_url.rstrip('/')}/audio/voices"
+
             try:
                 log.debug(f"Attempting to fetch voices from customTTS_openapi endpoint: {voices_url}")
                 # Prepare headers, including Authorization if key exists
@@ -1098,24 +1096,32 @@ def get_available_voices(request) -> dict:
                 response.raise_for_status() # Raise HTTP errors
                 data = response.json()
 
-                 # Expecting format like {"voices": [{"id": "vid", "name": "vname"}, ...]}
-                 # Need to convert this list into a {id: name} dictionary
+                # MODIFIED BY RED: Handle the case where voices is a list of strings
                 if isinstance(data, dict) and "voices" in data and isinstance(data["voices"], list):
-                    voices_list = data["voices"]
-                    # Create the {id: name} mapping
-                    available_voices = {voice.get("id"): voice.get("name", voice.get("id")) for voice in voices_list if voice.get("id")}
-                    if not available_voices: # Handle empty list response
-                         log.warning(f"Empty voice list received from {voices_url}. Using default.")
-                         available_voices = default_custom_voices
+                    voices_id_list = data["voices"]
+                    # Check if the list contains strings (as per your curl output)
+                    if all(isinstance(voice_id, str) for voice_id in voices_id_list):
+                        # Create the {id: name} mapping, using the ID as the name
+                        available_voices = {voice_id: voice_id for voice_id in voices_id_list}
+                        log.info(f"Loaded {len(available_voices)} voices (from string list) from {voices_url}")
+                    # Check if it's unexpectedly a list of dictionaries anyway
+                    elif all(isinstance(voice_dict, dict) for voice_dict in voices_id_list):
+                         available_voices = {voice.get("id"): voice.get("name", voice.get("id")) for voice in voices_id_list if voice.get("id")}
+                         log.info(f"Loaded {len(available_voices)} voices (from dict list) from {voices_url}")
                     else:
-                         log.info(f"Loaded {len(available_voices)} voices from {voices_url}")
+                         log.warning(f"Voice list from {voices_url} contains mixed types or unexpected item format. Using default.")
+                         available_voices = default_custom_voices
+
+                    if not available_voices: # Handle case where processing results in empty dict
+                         log.warning(f"Empty voice list received or processed from {voices_url}. Using default.")
+                         available_voices = default_custom_voices
                 else:
-                     log.warning(f"Unrecognized voice list format from {voices_url}. Using default.")
+                     log.warning(f"Unrecognized voice list format from {voices_url} (expected '{{voices: [...]}}'). Using default.")
                      available_voices = default_custom_voices
             except requests.RequestException as e:
                 log.error(f"Error fetching voices from {voices_url}: {str(e)}. Using default.")
                 available_voices = default_custom_voices
-            except Exception as e:
+            except Exception as e: # Catch potential JSONDecodeError or other issues
                 log.error(f"Unexpected error processing voices from {voices_url}: {str(e)}. Using default.")
                 available_voices = default_custom_voices
         else:

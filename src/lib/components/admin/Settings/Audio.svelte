@@ -171,6 +171,7 @@
 		const newEngine = event.currentTarget.value;
 		TTS_ENGINE = newEngine; // Update state immediately
 
+		
 		// Fetch voices and models relevant to the newly selected engine
 		// This will correctly result in empty arrays for '' and 'transformers'
 		await getVoices();
@@ -180,6 +181,11 @@
 		if (newEngine === 'openai') {
 			if (!TTS_VOICE) TTS_VOICE = 'alloy';
 			if (!TTS_MODEL) TTS_MODEL = 'tts-1';
+		} // ADDED by RED
+		else if (newEngine === 'customTTS_openapi') {
+            // Clear the fields when switching TO custom engine
+			TTS_VOICE = '';
+			TTS_MODEL = '';
 		}
 	};
 
