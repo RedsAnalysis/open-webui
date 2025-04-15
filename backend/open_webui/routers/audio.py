@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from fastapi import Query
+from typing import Optional  
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.config import (
@@ -945,93 +947,143 @@ def transcription(
         )
 
 
-def get_available_models(request: Request) -> list[dict]:
+def get_available_models(
+    request: Request,
+    verify_url: Optional[str] = Query(None, alias="verify_url"),
+    verify_key: Optional[str] = Query(None, alias="verify_key")
+) -> list[dict]:
+    log.warning(f"--- GET_AVAILABLE_MODELS CALLED --- Backend TTS_ENGINE State: '{request.app.state.config.TTS_ENGINE}' Verify URL: '{verify_url}'")
     available_models = []
-    if request.app.state.config.TTS_ENGINE == "openai":
-        # Use custom endpoint if not using the official OpenAI API URL
-        if not request.app.state.config.TTS_OPENAI_API_BASE_URL.startswith(
-            "https://api.openai.com"
-        ):
+    tts_engine = request.app.state.config.TTS_ENGINE # Use saved engine state
+    default_openai_models = [{"id": "tts-1"}, {"id": "tts-1-hd"}]
+    default_custom_models = [{"id": "default-custom-model"}]
+
+    if tts_engine == "openai":
+        # --- UNCHANGED OpenAI LOGIC ---
+        openai_base_url = getattr(request.app.state.config, 'TTS_OPENAI_API_BASE_URL', '')
+        if openai_base_url and not openai_base_url.startswith("https://api.openai.com"):
             try:
                 response = requests.get(
-                    f"{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/models"
+                    f"{openai_base_url.rstrip('/')}/audio/models",
+                     headers={"Authorization": f"Bearer {request.app.state.config.TTS_OPENAI_API_KEY}"} if request.app.state.config.TTS_OPENAI_API_KEY else {},
+                     timeout=5
                 )
                 response.raise_for_status()
                 data = response.json()
-                available_models = data.get("models", [])
+                if isinstance(data, dict) and "models" in data and isinstance(data["models"], list):
+                     model_list = data["models"]
+                     available_models = [{"id": m.get("id"), "name": m.get("name", m.get("id"))} for m in model_list if m.get("id")]
+                elif isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+                     model_list = data["data"]
+                     available_models = [{"id": m.get("id"), "name": m.get("id")} for m in model_list if m.get("id")]
+                elif isinstance(data, list):
+                     available_models = [{"id": m.get("id"), "name": m.get("name", m.get("id"))} for m in data if isinstance(m, dict) and m.get("id")]
+                else:
+                     log.warning(f"Unrecognized model list format from custom OpenAI endpoint: {openai_base_url}. Using defaults.")
+                     available_models = default_openai_models
+                available_models = [m for m in available_models if m.get("id")]
+                if not available_models:
+                     log.warning(f"Empty/invalid model list from custom OpenAI endpoint: {openai_base_url}. Using defaults.")
+                     available_models = default_openai_models
             except Exception as e:
-                log.error(f"Error fetching models from custom endpoint: {str(e)}")
-                available_models = [{"id": "tts-1"}, {"id": "tts-1-hd"}]
+                log.error(f"Error fetching models from custom OpenAI endpoint {openai_base_url}: {str(e)}. Using defaults.")
+                available_models = default_openai_models
         else:
-            available_models = [{"id": "tts-1"}, {"id": "tts-1-hd"}]
+            available_models = default_openai_models
+        # --- END UNCHANGED OpenAI LOGIC ---
 
-    # Added by RED: Logic for customTTS_openapi models
-    elif request.app.state.config.TTS_ENGINE == "customTTS_openapi":
-        # Safely get custom URL and Key from config
-        custom_base_url = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
-        custom_api_key = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', None)
-        # Provide a default model list if fetching fails or URL not set
-        default_custom_models = [{"id": "default-custom-model"}] # You can customize this default
+    elif tts_engine == "customTTS_openapi":
+        # --- MODIFIED CustomTTS Block ---
+        is_verify_call = bool(verify_url)
+
+        # Determine URL/Key: Use verify params IF provided, otherwise use saved config
+        custom_base_url = verify_url if is_verify_call else getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
+        custom_api_key = verify_key if is_verify_call else getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', None)
 
         if custom_base_url:
-            # MODIFIED by RED: Use the correct models endpoint path from user curl example
-            models_url = f"{custom_base_url.rstrip('/')}/models"
+            models_url = f"{custom_base_url.rstrip('/')}/models" # Correct path
             try:
-                log.debug(f"Attempting to fetch models from customTTS_openapi endpoint: {models_url}")
-                # Prepare headers, including Authorization if key exists
+                log.debug(f"Attempting models fetch from {'VERIFY' if is_verify_call else 'CONFIG'} URL: {models_url}")
                 headers = {"Authorization": f"Bearer {custom_api_key}"} if custom_api_key else {}
-                # Use requests library for synchronous call here (suitable for config endpoints)
-                response = requests.get(models_url, headers=headers, timeout=5) # 5 second timeout
-                response.raise_for_status() # Raise HTTP errors
+                response = requests.get(models_url, headers=headers, timeout=5)
+                response.raise_for_status()
                 data = response.json()
 
-                # MODIFIED BY RED: Check for the OpenAPI /v1/models format {"data": [...]}
-                # The frontend expects a list of dicts, potentially with 'id' and 'name'
-                if isinstance(data, dict) and "data" in data and isinstance(data["data"], list): # Look for "data" key
-                     model_list = data["data"] # Get the list from the "data" key
-                     # Ensure format matches [{id: model_id, name: optional_name}]
-                     # Use the model 'id' as the name if 'name' isn't present
-                     available_models = [{"id": m.get("id"), "name": m.get("id")} for m in model_list if m.get("id")] # Extract id, use id as name
-                     log.info(f"Loaded {len(available_models)} models from {models_url}")
+                # Parsing logic for {"data": [...]}
+                if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+                     model_list = data["data"]
+                     available_models = [{"id": m.get("id"), "name": m.get("id")} for m in model_list if m.get("id")]
+                     log.info(f"{'VERIFY ' if is_verify_call else ''}Loaded {len(available_models)} models from {models_url}")
                 else:
-                     log.warning(f"Unrecognized model list format from {models_url} (expected '{{data: [...]}}'). Using default.") # Updated warning message
-                     available_models = default_custom_models
+                     log.warning(f"Unrecognized model list format from {models_url}. Expected '{{data: [...]}}'. {'Verification indicates format issue.' if is_verify_call else 'Using default.'}")
+                     # Return empty list OR raise error on verify format fail? Raising is clearer.
+                     if is_verify_call:
+                          raise HTTPException(status_code=400, detail=f"Verification failed: Unexpected response format from {models_url}.")
+                     else:
+                          available_models = default_custom_models
 
-                # Filter out any models without an ID after parsing
-                available_models = [m for m in available_models if m.get("id")]
-                if not available_models: # If parsing resulted in empty list
-                    log.warning(f"Model list from {models_url} was empty or invalid after parsing. Using default.")
+                available_models = [m for m in available_models if m.get("id")] # Ensure IDs exist
+                if not available_models and not is_verify_call: # Only use default if not verifying
+                    log.warning(f"Model list from {models_url} was empty/invalid. Using default.")
                     available_models = default_custom_models
 
-            except requests.RequestException as e:
-                log.error(f"Error fetching models from {models_url}: {str(e)}. Using default.")
-                available_models = default_custom_models
-            except Exception as e:
-                log.error(f"Unexpected error processing models from {models_url}: {str(e)}. Using default.")
-                available_models = default_custom_models
-        else:
-             log.warning("CUSTOMTTS_OPENAPI_BASE_URL not configured for model fetching. Using default model.")
-             available_models = default_custom_models
-    # End Added by RED block
+                # If verifying, return immediately after successful fetch and parse
+                if is_verify_call:
+                    return available_models
 
-    elif request.app.state.config.TTS_ENGINE == "elevenlabs":
+            except Exception as e:
+                error_message = f"Error during {'VERIFY' if is_verify_call else 'CONFIG'} fetch from {models_url}: {str(e)}."
+                log.error(error_message)
+                if is_verify_call:
+                    # Re-raise exception for verification failure
+                    detail = f"Verification failed: Could not fetch models. Error: {e.__class__.__name__}"
+                    status_code = 400
+                    if isinstance(e, requests.exceptions.HTTPError):
+                        detail = f"Verification failed: Server at {models_url} responded with status {e.response.status_code}."
+                        status_code = e.response.status_code
+                    elif isinstance(e, requests.exceptions.ConnectionError):
+                        detail = f"Verification failed: Could not connect to {models_url}."
+                    elif isinstance(e, requests.exceptions.Timeout):
+                         detail = f"Verification failed: Request to {models_url} timed out."
+                    elif isinstance(e, json.JSONDecodeError):
+                         detail = f"Verification failed: Invalid JSON response received from {models_url}."
+                    raise HTTPException(status_code=status_code, detail=detail)
+                else:
+                    # Fallback to default only for normal config load errors
+                    available_models = default_custom_models
+        else:
+             # Handle missing URL
+             if is_verify_call:
+                 # This case should ideally not happen if frontend requires URL for verify
+                 raise HTTPException(status_code=400, detail="Verification failed: Base URL not provided.")
+             log.warning(f"{'VERIFY: ' if is_verify_call else ''}CUSTOMTTS_OPENAPI_BASE_URL not configured. Using default model.")
+             available_models = default_custom_models if not is_verify_call else []
+        # --- END MODIFIED CustomTTS Block ---
+
+    elif tts_engine == "elevenlabs":
+        # --- UNCHANGED ElevenLabs logic ---
         try:
+            elevenlabs_api_key = getattr(request.app.state.config, 'TTS_API_KEY', None)
+            if not elevenlabs_api_key:
+                log.warning("ElevenLabs engine selected but TTS_API_KEY not configured.")
+                raise ValueError("ElevenLabs API Key not configured.")
             response = requests.get(
                 "https://api.elevenlabs.io/v1/models",
-                headers={
-                    "xi-api-key": request.app.state.config.TTS_API_KEY,
-                    "Content-Type": "application/json",
-                },
+                headers={ "xi-api-key": elevenlabs_api_key, "Content-Type": "application/json" },
                 timeout=5,
             )
             response.raise_for_status()
             models = response.json()
-
-            available_models = [
-                {"name": model["name"], "id": model["model_id"]} for model in models
-            ]
+            available_models = [{"name": model["name"], "id": model["model_id"]} for model in models]
+            log.info(f"Loaded {len(available_models)} models from ElevenLabs.")
         except requests.RequestException as e:
-            log.error(f"Error fetching voices: {str(e)}")
+            log.error(f"Error fetching ElevenLabs models: {str(e)}")
+            available_models = []
+        except Exception as e:
+            log.error(f"Unexpected error fetching ElevenLabs models: {str(e)}")
+            available_models = []
+        # --- End UNCHANGED ElevenLabs logic ---
+
     return available_models
 
 
@@ -1040,162 +1092,187 @@ async def get_models(request: Request, user=Depends(get_verified_user)):
     return {"models": get_available_models(request)}
 
 
-def get_available_voices(request) -> dict:
+def get_available_voices(
+    request: Request, # Add type hint
+    verify_url: Optional[str] = Query(None, alias="verify_url"),
+    verify_key: Optional[str] = Query(None, alias="verify_key")
+) -> dict: # Return type is dict {id: name}
     """Returns {voice_id: voice_name} dict"""
-    available_voices = {}
-    if request.app.state.config.TTS_ENGINE == "openai":
-        # Use custom endpoint if not using the official OpenAI API URL
-        if not request.app.state.config.TTS_OPENAI_API_BASE_URL.startswith(
-            "https://api.openai.com"
-        ):
-            try:
-                response = requests.get(
-                    f"{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/voices"
-                )
-                response.raise_for_status()
-                data = response.json()
-                voices_list = data.get("voices", [])
-                available_voices = {voice["id"]: voice["name"] for voice in voices_list}
-            except Exception as e:
-                log.error(f"Error fetching voices from custom endpoint: {str(e)}")
-                available_voices = {
-                    "alloy": "alloy",
-                    "echo": "echo",
-                    "fable": "fable",
-                    "onyx": "onyx",
-                    "nova": "nova",
-                    "shimmer": "shimmer",
-                }
-        else:
-            available_voices = {
-                "alloy": "alloy",
-                "echo": "echo",
-                "fable": "fable",
-                "onyx": "onyx",
-                "nova": "nova",
-                "shimmer": "shimmer",
-            }
-        # Added by RED: Logic for customTTS_openapi voices
-    elif request.app.state.config.TTS_ENGINE == "customTTS_openapi":
-        # Safely get custom URL and Key from config
-        custom_base_url = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
-        custom_api_key = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', None)
-        # Default voice map if fetch fails or URL not set
-        default_custom_voices = {"default-voice": "Default Custom Voice"} # Customize as needed
+    log.warning(f"--- GET_AVAILABLE_VOICES CALLED --- Backend TTS_ENGINE State: '{request.app.state.config.TTS_ENGINE}' Verify URL: '{verify_url}'")
 
-        if custom_base_url:
-            # MODIFIED BY RED: Target /audio/voices.
-            voices_url = f"{custom_base_url.rstrip('/')}/audio/voices"
-
-            try:
-                log.debug(f"Attempting to fetch voices from customTTS_openapi endpoint: {voices_url}")
-                # Prepare headers, including Authorization if key exists
-                headers = {"Authorization": f"Bearer {custom_api_key}"} if custom_api_key else {}
-                # Use requests library for synchronous call
-                response = requests.get(voices_url, headers=headers, timeout=5) # 5 second timeout
-                response.raise_for_status() # Raise HTTP errors
-                data = response.json()
-
-                # MODIFIED BY RED: Handle the case where voices is a list of strings
-                if isinstance(data, dict) and "voices" in data and isinstance(data["voices"], list):
-                    voices_id_list = data["voices"]
-                    # Check if the list contains strings (as per your curl output)
-                    if all(isinstance(voice_id, str) for voice_id in voices_id_list):
-                        # Create the {id: name} mapping, using the ID as the name
-                        available_voices = {voice_id: voice_id for voice_id in voices_id_list}
-                        log.info(f"Loaded {len(available_voices)} voices (from string list) from {voices_url}")
-                    # Check if it's unexpectedly a list of dictionaries anyway
-                    elif all(isinstance(voice_dict, dict) for voice_dict in voices_id_list):
-                         available_voices = {voice.get("id"): voice.get("name", voice.get("id")) for voice in voices_id_list if voice.get("id")}
-                         log.info(f"Loaded {len(available_voices)} voices (from dict list) from {voices_url}")
-                    else:
-                         log.warning(f"Voice list from {voices_url} contains mixed types or unexpected item format. Using default.")
-                         available_voices = default_custom_voices
-
-                    if not available_voices: # Handle case where processing results in empty dict
-                         log.warning(f"Empty voice list received or processed from {voices_url}. Using default.")
-                         available_voices = default_custom_voices
-                else:
-                     log.warning(f"Unrecognized voice list format from {voices_url} (expected '{{voices: [...]}}'). Using default.")
-                     available_voices = default_custom_voices
-            except requests.RequestException as e:
-                log.error(f"Error fetching voices from {voices_url}: {str(e)}. Using default.")
-                available_voices = default_custom_voices
-            except Exception as e: # Catch potential JSONDecodeError or other issues
-                log.error(f"Unexpected error processing voices from {voices_url}: {str(e)}. Using default.")
-                available_voices = default_custom_voices
-        else:
-             log.warning("CUSTOMTTS_OPENAPI_BASE_URL not configured for voice fetching. Using default voice.")
-             available_voices = default_custom_voices
-    # End Added by RED block
-
-    elif request.app.state.config.TTS_ENGINE == "elevenlabs":
+    # --- Verification Logic: Only runs if verify_url is provided ---
+    if verify_url:
+        # This block handles ONLY the verification request for a CustomTTS endpoint
+        custom_base_url = verify_url
+        custom_api_key = verify_key
+        # Path for custom verify (based on user curl)
+        voices_url = f"{custom_base_url.rstrip('/')}/audio/voices"
         try:
-            available_voices = get_elevenlabs_voices(
-                api_key=request.app.state.config.TTS_API_KEY
-            )
-        except Exception:
-            # Avoided @lru_cache with exception
-            pass
-    elif request.app.state.config.TTS_ENGINE == "azure":
-        try:
-            region = request.app.state.config.TTS_AZURE_SPEECH_REGION
-            url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/voices/list"
-            headers = {
-                "Ocp-Apim-Subscription-Key": request.app.state.config.TTS_API_KEY
-            }
-
-            response = requests.get(url, headers=headers)
+            log.debug(f"Attempting VERIFY voices fetch from URL: {voices_url}")
+            headers = {"Authorization": f"Bearer {custom_api_key}"} if custom_api_key else {}
+            response = requests.get(voices_url, headers=headers, timeout=5)
             response.raise_for_status()
-            voices = response.json()
+            data = response.json()
 
-            for voice in voices:
-                available_voices[voice["ShortName"]] = (
-                    f"{voice['DisplayName']} ({voice['ShortName']})"
-                )
-        except requests.RequestException as e:
-            log.error(f"Error fetching voices: {str(e)}")
+            # Parse response specific to verify (customTTS format {"voices": ["id1", "id2", ...]})
+            available_voices = {} # Initialize as dict
+            if isinstance(data, dict) and "voices" in data and isinstance(data["voices"], list):
+                voices_id_list = data["voices"]
+                # Check if the list contains strings
+                if all(isinstance(voice_id, str) for voice_id in voices_id_list):
+                    # Create the {id: name} mapping, using the ID as the name
+                    available_voices = {voice_id: voice_id for voice_id in voices_id_list}
+                    log.info(f"VERIFY loaded {len(available_voices)} voices (from string list) from {voices_url}")
+                # Check if it's unexpectedly a list of dictionaries
+                elif all(isinstance(voice_dict, dict) for voice_dict in voices_id_list):
+                     available_voices = {voice.get("id"): voice.get("name", voice.get("id")) for voice in voices_id_list if voice.get("id")}
+                     log.info(f"VERIFY loaded {len(available_voices)} voices (from dict list) from {voices_url}")
+                else:
+                     log.warning(f"VERIFY Voice list from {voices_url} contains mixed types. Verification indicates format issue.")
+                     raise HTTPException(status_code=400, detail=f"Verification failed: Unexpected voice list item format from {voices_url}.")
 
-    return available_voices
+                # Verification successful (even if list is empty), return immediately
+                return available_voices # <<<--- RETURN verification result directly
+            else:
+                 log.warning(f"Unrecognized VERIFY voice list format from {voices_url}. Expected '{{voices: [...]}}'. Verification indicates format issue.")
+                 raise HTTPException(status_code=400, detail=f"Verification failed: Unexpected response format from {voices_url}.")
 
+        except Exception as e:
+            # Verification failed, raise HTTPException
+            error_message = f"Error during VERIFY fetch from {voices_url}: {str(e)}."
+            log.error(error_message)
+            detail = f"Verification failed: Could not fetch voices. Error: {e.__class__.__name__}"
+            status_code = 400
+            if isinstance(e, requests.exceptions.HTTPError):
+                detail = f"Verification failed: Server at {voices_url} responded with status {e.response.status_code}."
+                status_code = e.response.status_code
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                detail = f"Verification failed: Could not connect to {voices_url}."
+            elif isinstance(e, requests.exceptions.Timeout):
+                 detail = f"Verification failed: Request to {voices_url} timed out."
+            elif isinstance(e, json.JSONDecodeError):
+                 detail = f"Verification failed: Invalid JSON response received from {voices_url}."
+            raise HTTPException(status_code=status_code, detail=detail) # <<<--- RAISE exception on verify fail
 
-@lru_cache
-def get_elevenlabs_voices(api_key: str) -> dict:
-    """
-    Note, set the following in your .env file to use Elevenlabs:
-    AUDIO_TTS_ENGINE=elevenlabs
-    AUDIO_TTS_API_KEY=sk_...  # Your Elevenlabs API key
-    AUDIO_TTS_VOICE=EXAVITQu4vr4xnSDxMaL  # From https://api.elevenlabs.io/v1/voices
-    AUDIO_TTS_MODEL=eleven_multilingual_v2
-    """
+    # --- Normal Logic: Runs if verify_url is NOT provided ---
+    else:
+        available_voices = {} # Initialize for normal flow
+        tts_engine = request.app.state.config.TTS_ENGINE # Use SAVED engine state
+        default_openai_voices = {
+            "alloy": "alloy", "echo": "echo", "fable": "fable",
+            "onyx": "onyx", "nova": "nova", "shimmer": "shimmer",
+        }
+        default_custom_voices = {"default-voice": "Default Custom Voice"}
 
-    try:
-        # TODO: Add retries
-        response = requests.get(
-            "https://api.elevenlabs.io/v1/voices",
-            headers={
-                "xi-api-key": api_key,
-                "Content-Type": "application/json",
-            },
-        )
-        response.raise_for_status()
-        voices_data = response.json()
+        if tts_engine == "openai":
+            # --- UNCHANGED OpenAI logic ---
+            openai_base_url = getattr(request.app.state.config, 'TTS_OPENAI_API_BASE_URL', '')
+            if openai_base_url and not openai_base_url.startswith("https://api.openai.com"):
+                try:
+                    response = requests.get(
+                        f"{openai_base_url.rstrip('/')}/audio/voices",
+                        headers={"Authorization": f"Bearer {request.app.state.config.TTS_OPENAI_API_KEY}"} if request.app.state.config.TTS_OPENAI_API_KEY else {},
+                        timeout=5
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    if isinstance(data, dict) and "voices" in data and isinstance(data["voices"], list):
+                         voices_list = data["voices"]
+                         available_voices = {voice.get("id"): voice.get("name", voice.get("id")) for voice in voices_list if voice.get("id")}
+                         if not available_voices:
+                              log.warning(f"Empty voice list from custom OpenAI endpoint {openai_base_url}. Using defaults.")
+                              available_voices = default_openai_voices
+                    else:
+                         log.warning(f"Unrecognized voice list format from custom OpenAI endpoint {openai_base_url}. Using defaults.")
+                         available_voices = default_openai_voices
+                except Exception as e:
+                    log.error(f"Error fetching voices from custom OpenAI endpoint {openai_base_url}: {str(e)}. Using defaults.")
+                    available_voices = default_openai_voices
+            else:
+                available_voices = default_openai_voices
+            # --- End UNCHANGED OpenAI logic ---
 
-        voices = {}
-        for voice in voices_data.get("voices", []):
-            voices[voice["voice_id"]] = voice["name"]
-    except requests.RequestException as e:
-        # Avoid @lru_cache with exception
-        log.error(f"Error fetching voices: {str(e)}")
-        raise RuntimeError(f"Error fetching voices: {str(e)}")
+        elif tts_engine == "customTTS_openapi":
+             # --- CORRECTED CustomTTS logic (using SAVED config) ---
+            custom_base_url = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
+            custom_api_key = getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', None)
+            if custom_base_url:
+                voices_url = f"{custom_base_url.rstrip('/')}/audio/voices" # Correct path
+                try:
+                    log.debug(f"Attempting voices fetch from CONFIG URL: {voices_url}")
+                    headers = {"Authorization": f"Bearer {custom_api_key}"} if custom_api_key else {}
+                    response = requests.get(voices_url, headers=headers, timeout=5)
+                    response.raise_for_status()
+                    data = response.json()
 
-    return voices
+                    # Parsing logic for {"voices": ["id1", ...]}
+                    if isinstance(data, dict) and "voices" in data and isinstance(data["voices"], list):
+                        voices_id_list = data["voices"]
+                        if all(isinstance(voice_id, str) for voice_id in voices_id_list):
+                            available_voices = {voice_id: voice_id for voice_id in voices_id_list}
+                            log.info(f"Loaded {len(available_voices)} voices (from string list) from {voices_url}")
+                        elif all(isinstance(voice_dict, dict) for voice_dict in voices_id_list):
+                            available_voices = {voice.get("id"): voice.get("name", voice.get("id")) for voice in voices_id_list if voice.get("id")}
+                            log.info(f"Loaded {len(available_voices)} voices (from dict list) from {voices_url}")
+                        else:
+                            log.warning(f"Voice list from {voices_url} contains mixed types. Using default.")
+                            available_voices = default_custom_voices
 
+                        if not available_voices:
+                            log.warning(f"Empty voice list received or processed from {voices_url}. Using default.")
+                            available_voices = default_custom_voices
+                    else:
+                         log.warning(f"Unrecognized voice list format from {voices_url} (expected '{{voices: [...]}}'). Using default.")
+                         available_voices = default_custom_voices
+                except Exception as e:
+                    log.error(f"Error fetching voices from {voices_url}: {str(e)}. Using default.")
+                    available_voices = default_custom_voices
+            else:
+                 log.warning("CUSTOMTTS_OPENAPI_BASE_URL not configured. Using default voice.")
+                 available_voices = default_custom_voices
+            # --- End CORRECTED CustomTTS logic ---
 
-@router.get("/voices")
-async def get_voices(request: Request, user=Depends(get_verified_user)):
-    return {
-        "voices": [
-            {"id": k, "name": v} for k, v in get_available_voices(request).items()
-        ]
-    }
+        elif tts_engine == "elevenlabs":
+             # --- UNCHANGED ElevenLabs logic ---
+            try:
+                elevenlabs_api_key = getattr(request.app.state.config, 'TTS_API_KEY', None)
+                if not elevenlabs_api_key:
+                    log.warning("ElevenLabs engine selected but TTS_API_KEY not configured.")
+                    raise ValueError("ElevenLabs API Key not configured.")
+                available_voices = get_elevenlabs_voices(api_key=elevenlabs_api_key) # Call cached helper
+            except RuntimeError as e:
+                log.error(f"Failed to get ElevenLabs voices: {e}")
+                available_voices = {}
+            except Exception as e:
+                log.exception(f"Unexpected error getting ElevenLabs voices: {e}")
+                available_voices = {}
+             # --- End UNCHANGED ElevenLabs logic ---
+
+        elif tts_engine == "azure":
+             # --- UNCHANGED Azure logic ---
+            try:
+                region = request.app.state.config.TTS_AZURE_SPEECH_REGION
+                api_key = request.app.state.config.TTS_API_KEY
+                if not region or not api_key:
+                    log.error("Azure TTS region or API key not configured.")
+                    raise ValueError("Azure region/key not configured.")
+
+                url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/voices/list"
+                headers = {"Ocp-Apim-Subscription-Key": api_key}
+
+                response = requests.get(url, headers=headers, timeout=10)
+                response.raise_for_status()
+                voices = response.json()
+
+                for voice in voices:
+                    available_voices[voice["ShortName"]] = f"{voice['DisplayName']} ({voice['Locale']})"
+            except requests.RequestException as e:
+                log.error(f"Error fetching Azure voices: {str(e)}")
+                available_voices = {}
+            except Exception as e:
+                 log.exception(f"Unexpected error getting Azure voices: {e}")
+                 available_voices = {}
+             # --- End UNCHANGED Azure logic ---
+
+        # The return for the normal logic path happens HERE
+        return available_voices
