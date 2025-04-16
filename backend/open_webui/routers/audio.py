@@ -996,9 +996,8 @@ def get_available_models(
         # --- MODIFIED CustomTTS Block ---
         is_verify_call = bool(verify_url)
 
-        # Determine URL/Key: Use verify params IF provided, otherwise use saved config
-        custom_base_url = verify_url if is_verify_call else getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_BASE_URL', None)
-        custom_api_key = verify_key if is_verify_call else getattr(request.app.state.config, 'CUSTOMTTS_OPENAPI_KEY', None)
+        custom_base_url = request.app.state.config.CUSTOMTTS_OPENAPI_BASE_URL
+        custom_api_key = request.app.state.config.CUSTOMTTS_OPENAPI_KEY
 
         if custom_base_url:
             models_url = f"{custom_base_url.rstrip('/')}/models" # Correct path
