@@ -167,10 +167,9 @@ export const getModels = async (token: string = ''): Promise<AvailableModelsResp
 	return res;
 };
 
-const _fetchVoicesFromAPI = async (apiPath: string, token: string = '') => {
-    let error: string | null = null; // Changed to string or null for simplicity
+export const getVoices = async (token: string = '') => {
+	let error = null;
 
-<<<<<<< HEAD
 	const res = await fetch(`${AUDIO_API_BASE_URL}/voices`, {
 		method: 'GET',
 		headers: {
@@ -184,54 +183,14 @@ const _fetchVoicesFromAPI = async (apiPath: string, token: string = '') => {
 		})
 		.catch((err) => {
 			error = err.detail;
-			console.error(err);
-=======
-    const url = `${AUDIO_API_BASE_URL}${apiPath}`;
-    console.log(`API: Fetching voices from URL: ${url}`);
->>>>>>> 9b9fc9090 (added a front end elemnt to show Customtts on admin settings page and also changed the getvoices function to respond to /audio/voices endpoint)
+			console.log(err);
 
-    try {
-        const response = await fetch(url, {
-            method: 'GET',
-            headers: {
-                'Content-Type': 'application/json',
-                ...(token && { Authorization: `Bearer ${token}` }) // Include Auth only if token exists
-            }
-        });
+			return null;
+		});
 
-        if (!response.ok) {
-            let errorData: any = { detail: `Request failed with status: ${response.status} ${response.statusText}` };
-            try {
-                errorData = await response.json(); // Try to parse JSON error body
-            } catch (parseError) {
-                // Ignore parsing error, use the status text error
-            }
-            throw errorData; // Throw the error object (could be parsed JSON or the fallback)
-        }
-        return await response.json(); // Return parsed successful JSON response
-    } catch (err: any) {
-        console.error(`API Fetch Error from ${url}:`, err);
-        // Extract detail or use a generic message; re-throw a consistent error
-        error = err?.detail || (typeof err === 'string' ? err : `Failed to fetch from ${apiPath}`);
-        throw new Error(error); // Always throw an actual Error object
-    }
-};
+	if (error) {
+		throw error;
+	}
 
-
-// --- The SINGLE Exported Function for Getting Voices ---
-// It now accepts engineType to decide the path
-export const getVoices = async (token: string = '', engineType: string = '') => {
-    let apiPath = '/voices'; // Default endpoint
-
-    // *** The core logic change is here ***
-    if (engineType === 'customtts') {
-        apiPath = '/audio/voices'; // Use the custom endpoint path
-        console.log(`API: Engine is CustomTTS, using path: ${apiPath}`);
-    } else {
-         console.log(`API: Engine is '${engineType}', using default path: ${apiPath}`);
-    }
-    // Add more 'else if' conditions here if other engines ever need different paths
-
-    // Call the internal helper with the chosen path
-    return await _fetchVoicesFromAPI(apiPath, token);
+	return res;
 };
