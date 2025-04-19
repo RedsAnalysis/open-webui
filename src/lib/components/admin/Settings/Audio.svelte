@@ -48,6 +48,7 @@
 	let STT_DEEPGRAM_API_KEY = '';
 
 	let STT_WHISPER_MODEL_LOADING = false;
+	
 
 	// eslint-disable-next-line no-undef
 	let voices: SpeechSynthesisVoice[] = [];
@@ -269,6 +270,43 @@
 		await getVoices();
 		await getModels();
 	});
+
+	let isLoadingCustomTTSData = false;
+	async function fetchDataForEngine(engine: string) {
+    if (isFetchingEngineData) return;
+    isFetchingEngineData = true;
+
+    // *** Set loading flag SPECIFICALLY for customtts ***
+    if (engine === 'customtts') {
+        isLoadingCustomTTSData = true;
+        // Reset lists immediately so #if condition below hides the selects
+        voices = [];
+        models = [];
+        await tick(); // Allow DOM to update based on empty lists/loading flag
+    } else {
+         // Reset lists if needed for other engines before fetch
+         voices = []; models = []; await tick();
+    }
+
+    console.log(`[Fetcher] START for engine: ${engine}`);
+    // ... (determine needsApiVoices/needsApiModels) ...
+
+    try {
+        const voicePromise = needsApiVoices ? getVoices() : Promise.resolve();
+        const modelPromise = needsApiModels ? getModels() : Promise.resolve();
+        await Promise.all([voicePromise, modelPromise]);
+        console.log(`[Fetcher] Fetches complete for ${engine}.`);
+        // ... (post-fetch logic to select first item if needed) ...
+    } catch (error) { /* ... */ }
+    finally {
+        // *** Reset loading flag ***
+        if (engine === 'customtts') {
+             isLoadingCustomTTSData = false;
+        }
+        isFetchingEngineData = false;
+        console.log(`[Fetcher] END for engine: ${engine}`);
+    }
+}
 </script>
 
 <form
@@ -727,20 +765,21 @@
 					<div class=" flex gap-2">
 						<div class="w-full">
 							<div class=" mb-1.5 text-sm font-medium">{$i18n.t('TTS Voice')}</div>
-							<div class="flex w-full">
+							<div class="flex w-full">		
 								<div class="flex-1">
-									<select
+									<input
+										list="voice-list"
 										class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
 										bind:value={TTS_VOICE}
-										required={voices.length > 0}
-									>
-										<option value="" disabled selected={!TTS_VOICE}>{$i18n.t('Select a voice...')}
-										</option>
+										placeholder="Select a voice"
+									/>
 
-										{#each voices as voice (voice.id)}
+									<datalist id="voice-list">
+										{#each voices as voice}
 											<option value={voice.id}>{voice.name}</option>
 										{/each}
-									</select>
+									</datalist>
+									
 								</div>
 							</div>
 						</div>
@@ -748,18 +787,18 @@
 							<div class=" mb-1.5 text-sm font-medium">{$i18n.t('TTS Model')}</div>
 							<div class="flex w-full">
 								<div class="flex-1">
-									<select
+									<input
+										list="tts-model-list"
 										class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
 										bind:value={TTS_MODEL}
-										required={models.length > 0}
-									>
-										<option value="" disabled selected={!TTS_MODEL}>{$i18n.t('Select a model...')}
-										</option>
+										placeholder="Select a model"
+									/>
 
+									<datalist id="tts-model-list">
 										{#each models as model}
-											<option value={model.id}>{model.name || model.id}</option>
+											<option value={model.id} class="bg-gray-50 dark:bg-gray-700" />
 										{/each}
-									</select>
+									</datalist>
 								</div>
 							</div>
 						</div>
