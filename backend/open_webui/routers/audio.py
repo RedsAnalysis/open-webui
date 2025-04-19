@@ -142,6 +142,7 @@ class TTSConfigForm(BaseModel):
     SPLIT_ON: str
     AZURE_SPEECH_REGION: str
     AZURE_SPEECH_OUTPUT_FORMAT: str
+    CUSTOMTTS_ALLOWED_VOICES: str | None = None # Optional field
 
 
 class STTConfigForm(BaseModel):
@@ -169,6 +170,7 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
             "CUSTOM_TTS_OPEN_API_BASE_URL": request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL,
             "CUSTOM_TTS_OPEN_API_KEY": request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY,
+            "CUSTOMTTS_ALLOWED_VOICES": request.app.state.config.AUDIO_CUSTOMTTS_ALLOWED_VOICES,
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
@@ -199,6 +201,7 @@ async def update_audio_config(
     request.app.state.config.TTS_OPENAI_API_KEY = form_data.tts.OPENAI_API_KEY
     request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL = form_data.tts.CUSTOM_TTS_OPEN_API_BASE_URL
     request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY = form_data.tts.CUSTOM_TTS_OPEN_API_KEY
+    request.app.state.config.AUDIO_CUSTOMTTS_ALLOWED_VOICES = form_data.tts.CUSTOMTTS_ALLOWED_VOICES or ""
     request.app.state.config.TTS_API_KEY = form_data.tts.API_KEY
     request.app.state.config.TTS_ENGINE = form_data.tts.ENGINE
     request.app.state.config.TTS_MODEL = form_data.tts.MODEL
@@ -230,6 +233,7 @@ async def update_audio_config(
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
             "CUSTOM_TTS_OPEN_API_BASE_URL": request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL,
             "CUSTOM_TTS_OPEN_API_KEY" : request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY,
+            "CUSTOMTTS_ALLOWED_VOICES": request.app.state.config.AUDIO_CUSTOMTTS_ALLOWED_VOICES,
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
@@ -1061,6 +1065,16 @@ def get_available_voices(request) -> dict:
             except Exception as e: # Catch other errors like JSONDecodeError, processing errors
                  log.error(f"Unexpected error fetching or processing voices from custom TTS ({target_url}): {str(e)}")
                  # available_voices remains empty
+        allowed_voices_str = request.app.state.config.AUDIO_CUSTOMTTS_ALLOWED_VOICES
+        if allowed_voices_str: # Only filter if the setting is not empty
+            allowed_voice_ids = set(item.strip() for item in allowed_voices_str.split(',') if item.strip())
+            if allowed_voice_ids: # Check if set is not empty after parsing
+                available_voices = {
+                    voice_id: voice_name
+                    for voice_id, voice_name in available_voices.items()
+                    if voice_id in allowed_voice_ids
+                }
+                log.debug(f"Filtered CustomTTS voices based on allowed list: {list(available_voices.keys())}")
 
 
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":

@@ -2587,6 +2587,12 @@ AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY = PersistentConfig(
     os.getenv("AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY", AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY),
 )
 
+AUDIO_CUSTOMTTS_ALLOWED_VOICES = PersistentConfig(
+    "AUDIO_CUSTOMTTS_ALLOWED_VOICES",
+    "audio.tts.customtts_allowed_voices", # Unique path in config file
+    os.getenv("AUDIO_CUSTOMTTS_ALLOWED_VOICES", ""), # Default: empty string (allow all)
+)
+
 AUDIO_TTS_API_KEY = PersistentConfig(
     "AUDIO_TTS_API_KEY",
     "audio.tts.api_key",
