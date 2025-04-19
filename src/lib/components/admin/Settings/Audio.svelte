@@ -229,6 +229,9 @@
 		if (res) {
 			saveHandler();
 			config.set(await getBackendConfig());
+			await getVoices();
+			await getModels();
+			toast.success($i18n.t('Audio settings updated successfully!'));
 		}
 	};
 
