@@ -9,6 +9,9 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import { round } from '@huggingface/transformers';
 	import Spinner from '$lib/components/common/Spinner.svelte';
+
+	import Tooltip from '$lib/components/common/Tooltip.svelte'; // Add if not present
+
 	const dispatch = createEventDispatcher();
 
 	const i18n = getContext('i18n');
@@ -20,6 +23,7 @@
 	let speechAutoSend = false;
 	let responseAutoPlayback = false;
 	let nonLocalVoices = false;
+	let bargeInEnabled = false;
 
 	let STTEngine = '';
 
@@ -89,6 +93,8 @@
 		speechAutoSend = $settings.speechAutoSend ?? false;
 		responseAutoPlayback = $settings.responseAutoPlayback ?? false;
 
+		bargeInEnabled = $settings.bargeInEnabled ?? false;
+
 		STTEngine = $settings?.audio?.stt?.engine ?? '';
 
 		TTSEngine = $settings?.audio?.tts?.engine ?? '';
@@ -107,6 +113,11 @@
 
 	$: if (TTSEngine && TTSEngineConfig) {
 		onTTSEngineChange();
+	}
+
+	$: if (bargeInEnabled !== undefined && $settings.bargeInEnabled !== bargeInEnabled) {
+    	settings.update(s => ({ ...s, bargeInEnabled: bargeInEnabled }));
+    	console.log("User Setting: Updated $settings.bargeInEnabled reactively to:", bargeInEnabled);
 	}
 
 	const onTTSEngineChange = async () => {
@@ -154,21 +165,33 @@
 <form
 	class="flex flex-col h-full justify-between space-y-3 text-sm"
 	on:submit|preventDefault={async () => {
-		saveSettings({
-			audio: {
-				stt: {
-					engine: STTEngine !== '' ? STTEngine : undefined
-				},
-				tts: {
-					engine: TTSEngine !== '' ? TTSEngine : undefined,
-					engineConfig: TTSEngineConfig,
-					playbackRate: playbackRate,
-					voice: voice !== '' ? voice : undefined,
-					defaultVoice: $config?.audio?.tts?.voice ?? '',
-					nonLocalVoices: $config.audio.tts.engine === '' ? nonLocalVoices : undefined
-				}
-			}
-		});
+
+		// Prepare the audio-specific settings object
+        const audioSettingsPayload = {
+            stt: {
+                engine: STTEngine !== '' ? STTEngine : undefined
+            },
+            tts: {
+                engine: TTSEngine !== '' ? TTSEngine : undefined,
+                engineConfig: TTSEngineConfig,
+                playbackRate: playbackRate,
+                voice: voice !== '' ? voice : undefined,
+                defaultVoice: $config?.audio?.tts?.voice ?? '',
+                nonLocalVoices: $config.audio.tts.engine === '' ? nonLocalVoices : undefined
+            }
+        };
+
+        // Create the final payload including top-level settings managed here
+        const settingsToSave = {
+            audio: audioSettingsPayload, // The audio-specific part
+            // Add other top-level settings managed by this component:
+            conversationMode: conversationMode,
+            speechAutoSend: speechAutoSend,
+            responseAutoPlayback: responseAutoPlayback,
+            bargeInEnabled: bargeInEnabled // Include bargeInEnabled here
+        };
+
+		saveSettings(settingsToSave);
 		dispatch('save');
 	}}
 >
@@ -284,6 +307,18 @@
 		</div>
 
 		<hr class=" border-gray-100 dark:border-gray-850" />
+
+						<!-- Start Barge-in Toggle -->
+						<div class=" py-0.5 flex w-full justify-between">
+							<div class=" self-center text-xs font-medium">{$i18n.t('Barge-in (Interrupt TTS)')}</div>
+								 <Tooltip content={$i18n.t('Enable interrupting assistant speech by speaking')}>
+									  <Switch bind:state={bargeInEnabled} />
+								  </Tooltip>
+						</div>
+						<div class="mt-1 mb-1 text-xs text-gray-400 dark:text-gray-500">
+							 {$i18n.t("Allows you to interrupt the assistant's speech simply by starting to speak.")}
+						</div>
+							 <!-- End Barge-in Toggle -->
 
 		{#if TTSEngine === 'browser-kokoro'}
 			{#if TTSModel}

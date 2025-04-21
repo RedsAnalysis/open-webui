@@ -14,6 +14,10 @@
 	import type { i18n as i18nType } from 'i18next';
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
+	// VAD imports
+	import * as ort from 'onnxruntime-web';
+	import { vad } from '$lib/utils/vad';
+
 	import {
 		chatId,
 		chats,
@@ -133,6 +137,27 @@
 
 	let taskIds = null;
 
+	// Add this block for VAD & Barge-in State
+	let vadProcessor: vad | null = null; // To hold the VAD utility instance
+	let isTTSPlaying = false;
+	let isListeningForBargeIn = false;
+	let isRecordingForSTT = false; // State for post-barge-in recording
+	let audioContext: AudioContext | null = null;
+	let micStream: MediaStream | null = null;
+	let micSource: MediaStreamAudioSourceNode | null = null;
+	let scriptNode: AudioWorkletNode | null = null;
+	let isVadWorkletModuleAdded = false;
+	let audioChunksForSTT: Blob[] = []; // To store audio chunks after barge-in
+	let mediaRecorder: MediaRecorder | null = null;
+	let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+	const SILENCE_TIMEOUT_MS = 1500; // Stop recording after 1.5 seconds of silence (adjustable)
+
+	// VAD Model Path (Ensure this matches the location in your /static folder)
+	const VAD_MODEL_PATH = `${WEBUI_BASE_URL}/static/vad/silero_vad_16k_op15.onnx`;
+
+	// Optional: Reference to the specific audio element if needed for stopping TTS
+	// let currentAudioPlayer: HTMLAudioElement | null = null;
+
 	// Chat Input
 	let prompt = '';
 	let chatFiles = [];
@@ -210,6 +235,399 @@
 				$tools.find((t) => t.id === id)
 			);
 		}
+	};
+
+	const initializeVAD = async () => {
+    	if (vadProcessor || !$settings.bargeInEnabled) return; // Already initialized or setting is off
+
+    	try {
+        	console.log('Initializing VAD...');
+
+        	// ***** ADD THIS BLOCK - Configure WASM Paths *****
+        	// Set the path for WASM files. This should be the *URL path* relative
+        	// to the root of your served application where you copied the files.
+        	const wasmDir = `${WEBUI_BASE_URL}/static/ort-wasm-files/`;
+        	ort.env.wasm.wasmPaths = {
+            	// List ONLY the files that actually exist in your /static/ort-wasm-files/
+            	'ort-wasm-simd-threaded.wasm': `${wasmDir}ort-wasm-simd-threaded.wasm`,
+            	'ort-wasm-simd-threaded.jsep.wasm': `${wasmDir}ort-wasm-simd-threaded.jsep.wasm`,
+        	};
+        	console.log('Set ORT WASM paths:', ort.env.wasm.wasmPaths);
+        	// ***** END OF ADDED BLOCK *****
+
+        	// Now create the Inference Session AFTER setting the paths
+        	const model = await ort.InferenceSession.create(VAD_MODEL_PATH, {
+            	executionProviders: ['wasm'] // Keep 'wasm' provider
+        	});
+
+        	// Instantiate your VAD utility class
+        	vadProcessor = new vad(model, ort); // Pass ONNX runtime reference
+        	console.log('VAD Initialized successfully.');
+
+    	} catch (e) {
+        	console.error('Failed to initialize VAD:', e);
+        	// Provide more specific error feedback if possible
+        	let errorMsg = $i18n.t('Failed to initialize VAD model for barge-in.');
+        	if (e.message.includes("WebAssembly")) {
+            	errorMsg += ' ' + $i18n.t('Please check WASM file paths and browser compatibility.');
+        	} else if (e.message.includes("fetch")) {
+             	errorMsg += ' ' + $i18n.t('Could not load the VAD model file. Check the path.');
+        	}
+        	toast.error(errorMsg);
+        	vadProcessor = null; // Ensure it's null on failure
+    }
+};
+
+
+	// Add these functions to start/stop VAD on the microphone stream
+	const startListeningForBargeIn = async () => {
+			if (!$settings.bargeInEnabled || isListeningForBargeIn || !vadProcessor || isRecordingForSTT) {
+				return; // Exit if disabled, already listening, VAD not ready, or already recording STT
+			}
+			console.log('Attempting to start VAD Worklet for barge-in...');
+
+			try {
+				// --- Microphone Stream Management ---
+				if (!micStream || micStream.active === false) {
+						console.log('Requesting new microphone stream for VAD Worklet.');
+						micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+						console.log('Microphone stream obtained for VAD Worklet.');
+					}
+				// --- End Microphone Stream Management ---
+
+				// --- AudioContext Management ---
+				if (!audioContext || audioContext.state === 'closed') {
+						console.log('Creating new AudioContext for VAD Worklet (16kHz).');
+						audioContext = new AudioContext({ sampleRate: 16000 }); // VAD model expects 16kHz
+						isVadWorkletModuleAdded = false; // Reset flag if context is new
+					}
+				if (audioContext.state === 'suspended') {
+						console.log('Resuming suspended AudioContext.');
+						await audioContext.resume();
+					}
+				// --- End AudioContext Management ---
+
+				// --- Add AudioWorklet Module (only once per context) ---
+				if (!isVadWorkletModuleAdded) {
+					try {
+						console.log('Adding VAD AudioWorklet module...');
+						// Adjust path if you placed vad-processor.js elsewhere in /static/
+						await audioContext.audioWorklet.addModule(`${WEBUI_BASE_URL}/static/vad-processor.js`);
+						isVadWorkletModuleAdded = true;
+						console.log('VAD AudioWorklet module added successfully.');
+					} catch (e) {
+						console.error('Failed to add VAD AudioWorklet module:', e);
+						toast.error($i18n.t('Failed to load audio processor for barge-in.'));
+						return; // Cannot proceed without the module
+					}
+				}
+			// --- End Add AudioWorklet Module ---
+
+			// Create MediaStreamSource
+				micSource = audioContext.createMediaStreamSource(micStream);
+
+			// Create AudioWorkletNode
+        	console.log('Creating AudioWorkletNode...');
+				scriptNode = new AudioWorkletNode(audioContext, 'vad-processor'); // Name matches registerProcessor name
+        	console.log('AudioWorkletNode created.');
+
+
+				// --- Handle Messages from the Worklet ---
+				scriptNode.port.onmessage = (event) => {
+					// Double-check flags inside the message handler
+						if (!isListeningForBargeIn || !vadProcessor || isRecordingForSTT) return;
+
+            		// event.data contains the Float32Array sent from the processor
+						const inputData = event.data;
+
+           	if (!inputData) return; // Ignore empty messages
+
+				// Run VAD inference on the main thread
+						try {
+								const speechProb = vadProcessor.process(inputData);
+
+						// Adjust threshold as needed
+								const VAD_THRESHOLD = 0.6;
+								if (speechProb > VAD_THRESHOLD) {
+									console.log('VAD Worklet: Speech detected!', speechProb.toFixed(3));
+								// Trigger barge-in logic
+									handleBargeIn();
+                    				// Note: handleBargeIn will call stopListeningForBargeIn,
+                    				// which should disconnect the node and stop messages.
+								}
+						} catch (e) {
+								console.error('VAD processing error (main thread):', e);
+                			// Optionally stop listening on error
+                stopListeningForBargeIn();
+						}
+				};
+        		// --- End Handle Messages from the Worklet ---
+
+        	scriptNode.port.onmessageerror = (error) => {
+            	console.error("Error receiving message from VAD worklet:", error);
+        	}
+
+        	scriptNode.onprocessorerror = (error) => {
+            	// This catches errors thrown *inside* the AudioWorkletProcessor's process method
+            	console.error("Error reported from VAD AudioWorkletProcessor:", error);
+            	toast.error($i18n.t("Audio processing error occurred. Barge-in might stop."));
+            	stopListeningForBargeIn(); // Stop listening on processor error
+        	}
+
+
+					// Connect the nodes: Mic -> AudioWorkletNode -> Destination
+					micSource.connect(scriptNode);
+        			// Connecting to destination is often necessary for the worklet to process actively
+					scriptNode.connect(audioContext.destination);
+
+					isListeningForBargeIn = true;
+					console.log('VAD Worklet listening started.');
+
+			} catch (error) {
+					console.error('Error starting VAD Worklet listener:', error);
+					if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+						toast.error($i18n.t('Microphone access denied. Please allow microphone access for barge-in.'));
+					} else {
+            	toast.error($i18n.t('Could not start microphone for barge-in: {{error}}', { error: error.message }));
+        		}
+					stopListeningForBargeIn(); // Clean up any partial setup
+			}
+	};
+
+	const stopListeningForBargeIn = () => {
+			if (!isListeningForBargeIn && !scriptNode && !micSource) return; // Nothing to stop
+			console.log('Stopping VAD Worklet listener...');
+
+		// --- Clean up message port ---
+    	if(scriptNode?.port) {
+        	scriptNode.port.onmessage = null; // Remove the message handler
+        	scriptNode.port.onmessageerror = null;
+        // Optionally close the port if the worklet doesn't need it anymore,
+        // but simply removing the handler is usually sufficient.
+        // scriptNode.port.close();
+    	}
+    	if(scriptNode) {
+        	scriptNode.onprocessorerror = null; // Remove error handler
+    	}
+    // --- End clean up message port ---
+
+
+			if (scriptNode) {
+				scriptNode.disconnect(); // Disconnect from destination and source
+				scriptNode = null;
+			}
+			if (micSource) {
+				micSource.disconnect(); // Disconnect from mic stream
+				micSource = null;
+			}
+
+			isListeningForBargeIn = false;
+			if (vadProcessor) {
+				vadProcessor.reset_state(); // Reset VAD model state
+			}
+			console.log('VAD Worklet listener stopped.');
+	};
+
+	const handleBargeIn = () => {
+			// Ensure it's a valid barge-in event (TTS was playing, VAD was listening)
+			if (!isTTSPlaying || !isListeningForBargeIn) return;
+
+			console.log('Barge-in detected! Stopping TTS and starting STT recording.');
+
+    		// Stop TTS playback first
+			stopTTSPlayback(); // This will also set isTTSPlaying = false
+
+    		// Stop VAD listener *after* stopping TTS (as stopTTSPlayback might also call it)
+			stopListeningForBargeIn();
+
+			// Immediately start capturing the user's speech for STT
+			startSTTRecording();
+	};
+
+	// Add this function to stop TTS playback (ADAPT BASED ON ACTUAL IMPLEMENTATION)
+	const stopTTSPlayback = () => {
+			if (!isTTSPlaying) return; // Already stopped
+
+			console.log('Stopping TTS playback...');
+			isTTSPlaying = false; // Set state immediately
+
+		// --- CHOOSE/ADAPT THE CORRECT METHOD BELOW ---
+
+		// Option 1: Browser SpeechSynthesis API (Global Stop)
+		// If your TTS uses the browser's built-in speech synthesis:
+			// window.speechSynthesis?.cancel();
+    		// console.log("Called window.speechSynthesis.cancel()");
+
+		// Option 2: Using the main <audio> element in Chat.svelte
+    	// If TTS plays through the <audio id="audioElement"> tag in this component:
+    	const audioElement = document.getElementById('audioElement') as HTMLAudioElement;
+    	if (audioElement && !audioElement.paused) {
+        	audioElement.pause();
+        	audioElement.src = ''; // Clear source to prevent resuming same audio
+        	console.log("Paused and cleared src of main audioElement");
+    		}
+
+	// Option 3: TTS handled within Messages.svelte or another component
+    // If Messages.svelte handles playback per message, signal it to stop.
+    // (Messages.svelte would need to add a listener for 'tts:stop' on eventTarget)
+    // eventTarget.dispatchEvent(new CustomEvent('tts:stop'));
+    // console.log("Dispatched tts:stop event for other components");
+
+ 	// Option 4: Web Audio API SourceNode (If TTS uses Web Audio directly)
+ 	// If you have a reference to the specific AudioBufferSourceNode playing TTS:
+ 	// if (currentAudioSourceNode) { // Assuming you track this node
+ 	// 	currentAudioSourceNode.stop();
+ 	// 	currentAudioSourceNode = null;
+    //  console.log("Stopped Web Audio source node");
+ 	// }
+
+    // --- END OF ADAPTATION SECTION ---
+
+    // Ensure VAD listener is stopped if TTS is stopped
+    	if (isListeningForBargeIn) {
+        	stopListeningForBargeIn();
+    		}
+	};
+
+	const startSTTRecording = async () => {
+		// Prevent starting if already recording or mic stream isn't ready
+			if (isRecordingForSTT || !micStream || !micStream.active) {
+        	console.warn("Cannot start STT recording. Conditions not met:", { isRecordingForSTT, micStreamExists: !!micStream, micStreamActive: micStream?.active });
+        // If micStream is missing/inactive, maybe try re-acquiring? (Risky if MessageInput needs it)
+        // For now, just prevent starting.
+        	return;
+    		}
+
+			console.log('Starting STT recording...');
+			audioChunksForSTT = []; // Clear any previous data
+			isRecordingForSTT = true;
+
+			// TODO: Add visual feedback to indicate recording (e.g., change mic icon state)
+    		// Be mindful of coordinating this with MessageInput's UI state.
+
+			try {
+				// Determine a suitable MIME type, 'audio/webm;codecs=opus' is widely supported
+        	const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+            	? 'audio/webm;codecs=opus'
+            	: MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
+            	? 'audio/ogg;codecs=opus'
+            	: 'audio/webm'; // Fallback
+        	console.log("Using MIME type for recording:", mimeType);
+
+				mediaRecorder = new MediaRecorder(micStream, { mimeType });
+
+				mediaRecorder.ondataavailable = (event: BlobEvent) => {
+					if (event.data.size > 0) {
+							audioChunksForSTT.push(event.data);
+						// Reset the silence timer every time we get a chunk of data
+                resetSilenceTimer();
+					}
+				};
+
+				mediaRecorder.onstop = async () => {
+					console.log('STT recording stopped. Processing audio.');
+					isRecordingForSTT = false; // Update state
+            		// Clear timer just in case
+					if (silenceTimer) clearTimeout(silenceTimer);
+            silenceTimer = null;
+
+            // TODO: Reset any visual recording indicator here
+
+					if (audioChunksForSTT.length === 0) {
+						console.log('No audio data recorded for STT.');
+						return; // Nothing to transcribe
+					}
+
+            		// Combine chunks into a single Blob
+					const audioBlob = new Blob(audioChunksForSTT, { type: mimeType });
+            // Important: Clear chunks *after* creating the Blob
+            audioChunksForSTT = [];
+
+            if (audioBlob.size === 0) {
+                console.log('Audio blob is empty, skipping transcription.');
+                return;
+            }
+
+            console.log(`Created audio blob: ${audioBlob.size} bytes, type: ${audioBlob.type}`);
+
+            // --- Send to STT API ---
+            try {
+                toast.info($i18n.t('Transcribing your voice...'));
+                // Create a File object for the API
+                const audioFile = new File([audioBlob], `barge_in_audio.${mimeType.split('/')[1].split(';')[0]}`, { type: mimeType });
+
+                const transcription = await transcribeAudio(localStorage.token, audioFile);
+
+                if (transcription && transcription.text && transcription.text.trim() !== '') {
+                    console.log("Transcription result:", transcription.text);
+                    toast.success($i18n.t('Transcription complete.'));
+
+                    // Update the main prompt variable. Assumes MessageInput binds to this.
+                    prompt = transcription.text;
+                    await tick(); // Let Svelte update the UI
+
+                    // Option 1: Automatically submit the prompt (uncomment to enable)
+                    // console.log("Auto-submitting transcribed prompt.");
+                    // submitPrompt(prompt);
+
+                    // Option 2: Just fill the input and focus (current behavior)
+                    const chatInput = document.getElementById('chat-input');
+                    chatInput?.focus();
+
+                } else {
+                    console.warn("Transcription result empty or missing text:", transcription);
+                    toast.warning($i18n.t('Transcription finished, but no text was detected.'));
+                }
+            } catch (error) {
+                console.error("Transcription API error:", error);
+                toast.error($i18n.t('Error during transcription: {{error}}', { error: error?.detail || error?.message || error }));
+            }
+            // --- End Send to STT API ---
+				};
+
+        mediaRecorder.onerror = (event: Event) => {
+            console.error("MediaRecorder error:", event);
+            toast.error($i18n.t("An error occurred during recording."));
+            // Attempt to clean up
+            if (isRecordingForSTT) {
+                stopSTTRecording(); // This might call onstop again, but state flags should prevent issues
+            }
+        }
+
+        // Start recording and the silence timer
+				mediaRecorder.start(250); // Collect chunks every 250ms (adjustable)
+        console.log("MediaRecorder started.");
+        resetSilenceTimer(); // Start the initial silence countdown
+
+	} catch (error) {
+		console.error('Error starting MediaRecorder:', error);
+		toast.error($i18n.t('Could not start voice recording: {{error}}', {error: error.message}));
+		isRecordingForSTT = false; // Reset state
+        mediaRecorder = null; // Clear recorder instance
+        // TODO: Reset any visual recording indicator here
+	}
+	};
+
+	const resetSilenceTimer = () => {
+    	if (silenceTimer) clearTimeout(silenceTimer);
+    	silenceTimer = setTimeout(() => {
+        	console.log("Silence detected, stopping STT recording.");
+        // Only stop if actually recording
+        if (isRecordingForSTT && mediaRecorder && mediaRecorder.state === 'recording') {
+            stopSTTRecording();
+        }
+    }, SILENCE_TIMEOUT_MS);
+	};
+
+	const stopSTTRecording = () => {
+			// Check if we are recording and the recorder exists and is in the 'recording' state
+			if (!isRecordingForSTT || !mediaRecorder || mediaRecorder.state !== 'recording') {
+				return; // Not recording or recorder not ready/already stopped
+			}
+    	console.log("Stopping STT recording via stopSTTRecording function...");
+    	// This is the key call: it stops recording AND triggers the 'onstop' event handler
+			mediaRecorder.stop();
+    	// State changes (isRecordingForSTT = false) and timer clearing happen within the onstop handler.
 	};
 
 	const showMessage = async (message) => {
@@ -414,6 +832,10 @@
 			}
 		}
 
+		if ($settings.bargeInEnabled) {
+        	await initializeVAD();
+    	}
+
 		if (localStorage.getItem(`chat-input-${chatIdProp}`)) {
 			try {
 				const input = JSON.parse(localStorage.getItem(`chat-input-${chatIdProp}`));
@@ -457,7 +879,31 @@
 		chats.subscribe(() => {});
 	});
 
+	// Add this reactive block to handle setting changes
+	$: if ($settings?.bargeInEnabled) {
+			initializeVAD(); // Initialize if enabled and not already done/initializing
+	} else {
+    // If setting is disabled, ensure VAD listener is stopped
+    	if (isListeningForBargeIn) {
+        	stopListeningForBargeIn();
+    	}
+    // Optionally: consider more aggressive cleanup like closing AudioContext
+    // if barge-in is the *only* user of it. Be careful if other features need it.
+	}
+
+
 	onDestroy(() => {
+
+		stopTTSPlayback(); // Stop any ongoing TTS and VAD listening
+    	stopSTTRecording(); // Stop any ongoing STT recording
+
+		// Close AudioContext if it exists and we're sure it's safe to do so
+		if (audioContext && audioContext.state !== 'closed') {
+        	console.log("Closing AudioContext on component destroy.");
+        	audioContext.close().catch(e => console.warn("Error closing AudioContext:", e));
+        	audioContext = null;
+    		}
+
 		chatIdUnsubscriber?.();
 		window.removeEventListener('message', onMessageHandler);
 		$socket?.off('chat-events', chatEventHandler);
@@ -650,6 +1096,9 @@
 	//////////////////////////
 
 	const initNewChat = async () => {
+	  stopTTSPlayback(); // Ensure clean state for new chat
+	  stopSTTRecording();
+
 		if ($page.url.searchParams.get('models')) {
 			selectedModels = $page.url.searchParams.get('models')?.split(',');
 		} else if ($page.url.searchParams.get('model')) {
@@ -1119,6 +1568,17 @@
 				} else {
 					message.content += value;
 
+					// --- Add Barge-in Trigger Start ---
+            		// Heuristic: If TTS isn't playing, but setting is enabled & auto-playback is on,
+            		// assume TTS might start soon due to new content.
+            		if (!isTTSPlaying && $settings.bargeInEnabled && $settings.responseAutoPlayback) {
+                		console.log("Potential TTS start detected by content change.");
+                		isTTSPlaying = true; // Tentatively set flag
+                		await tick(); // Allow potential DOM updates (e.g., speak button visibility)
+                		startListeningForBargeIn(); // Start VAD listener
+            		}
+            		// --- End Barge-in Trigger Start ---
+
 					if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 						navigator.vibrate(5);
 					}
@@ -1150,6 +1610,15 @@
 		}
 
 		if (content) {
+
+			// --- Add Barge-in Trigger Start (for non-streamed content) ---
+			if (!isTTSPlaying && $settings.bargeInEnabled && $settings.responseAutoPlayback) {
+                console.log("Potential TTS start detected by non-streamed content.");
+                isTTSPlaying = true;
+                await tick();
+                startListeningForBargeIn();
+            }
+        	// --- End Barge-in Trigger Start ---
 			// REALTIME_CHAT_SAVE is disabled
 			message.content = content;
 
@@ -1194,6 +1663,54 @@
 
 		if (done) {
 			message.done = true;
+
+			// --- Add Barge-in Trigger Start (if auto-play clicks button) ---
+			if ($settings.responseAutoPlayback && !$showCallOverlay) {
+            	if (!isTTSPlaying && $settings.bargeInEnabled) {
+                	console.log("TTS start triggered by auto-playback setting on 'done'.");
+                	isTTSPlaying = true; // Set flag before clicking play
+                	startListeningForBargeIn(); // Start VAD before clicking play
+            	}
+            	await tick();
+            	document.getElementById(`speak-button-${message.id}`)?.click(); // This likely starts the actual audio
+        	}
+        	// --- End Barge-in Trigger Start ---
+
+			// --- Add Listeners for Normal TTS End ---
+        	// We need to stop VAD listening when TTS finishes WITHOUT barge-in.
+        	// Method 1: Listen to the 'ended' event on the relevant audio player.
+        	// Adapt selector/logic if TTS is played differently.
+        	const audioElement = document.getElementById('audioElement') as HTMLAudioElement;
+        	if (audioElement) {
+            	const onAudioEnded = () => {
+                	console.log("AudioElement 'ended' or 'pause' event triggered for message:", message.id);
+                	if (isTTSPlaying) { // Only act if we thought TTS was playing for THIS completion
+                    	isTTSPlaying = false;
+                    	stopListeningForBargeIn(); // Stop VAD listener on normal completion/pause
+                	}
+                	// Remove listeners to prevent memory leaks
+                	audioElement.removeEventListener('ended', onAudioEnded);
+                	audioElement.removeEventListener('pause', onAudioEnded);
+            	};
+            	// Use { once: true } if appropriate, but listening might need to persist if audio pauses/resumes?
+            	// Let's add listeners that remove themselves.
+            	audioElement.addEventListener('ended', onAudioEnded);
+            	audioElement.addEventListener('pause', onAudioEnded); // Treat manual pause as end for VAD
+        	}
+
+        	// Method 2: Listen for your custom 'chat:finish' event if it reliably signals audio end.
+        	const handleChatFinish = (event) => {
+             	if (event.detail.id === message.id) {
+                 	console.log("'chat:finish' event detected for message:", message.id);
+                 	if (isTTSPlaying) {
+                     	isTTSPlaying = false;
+                     	stopListeningForBargeIn();
+                 	}
+                 	eventTarget.removeEventListener('chat:finish', handleChatFinish); // Clean up listener
+             	}
+        	}
+        	eventTarget.addEventListener('chat:finish', handleChatFinish);
+        	// --- End Listeners for Normal TTS End ---
 
 			if ($settings.responseAutoCopy) {
 				copyToClipboard(message.content);
@@ -1245,6 +1762,9 @@
 	//////////////////////////
 
 	const submitPrompt = async (userPrompt, { _raw = false } = {}) => {
+	  stopTTSPlayback(); // Stop TTS/VAD before sending new prompt
+      stopSTTRecording(); // Stop STT recording before sending new prompt
+
 		console.log('submitPrompt', userPrompt, $chatId);
 
 		const messages = createMessagesList(history, history.currentId);
@@ -1720,6 +2240,8 @@
 	};
 
 	const stopResponse = async () => {
+	  stopTTSPlayback(); // Stop any ongoing TTS and related VAD listening
+      stopSTTRecording(); // Stop any ongoing STT recording (if barge-in occurred)
 		if (taskIds) {
 			for (const taskId of taskIds) {
 				const res = await stopTask(localStorage.token, taskId).catch((error) => {
