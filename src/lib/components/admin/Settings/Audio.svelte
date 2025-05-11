@@ -700,7 +700,7 @@
 										<option value="" disabled selected={!TTS_VOICE}>{$i18n.t('Select a voice...')}
 										</option>
 
-										{#each voices as voice (voice.id)}
+										{#each voices as voice}
 											<option value={voice.id}>{voice.name}</option>
 										{/each}
 									</select>
