@@ -675,15 +675,26 @@
 
 								To learn more about SpeechT5,
 
-									<datalist id="tts-model-list">
-										{#each models as model}
-											<option value={model.id} class="bg-gray-50 dark:bg-gray-700" />
-										{/each}
-									</datalist>
-								</div>
+								<a
+									class=" hover:underline dark:text-gray-200 text-gray-800"
+									href="https://github.com/microsoft/SpeechT5"
+									target="_blank"
+								>
+									{$i18n.t(`click here`, {
+										name: 'SpeechT5'
+									})}.
+								</a>
+								To see the available CMU Arctic speaker embeddings,
+								<a
+									class=" hover:underline dark:text-gray-200 text-gray-800"
+									href="https://huggingface.co/datasets/Matthijs/cmu-arctic-xvectors"
+									target="_blank"
+								>
+									{$i18n.t(`click here`)}.
+								</a>
 							</div>
 						</div>
-					</div>
+					
 				
 				
 				{:else if TTS_ENGINE === 'customtts'}
@@ -728,6 +739,7 @@
 						</div>
 					</div>
 
+
 				{:else if TTS_ENGINE === 'azure'}
 					<div class=" flex gap-2">
 						<div class="w-full">
@@ -771,6 +783,7 @@
 								</a>
 							</div>
 						</div>
+					</div>
 					{:else if TTS_ENGINE === 'openai'}
 						<div class=" flex gap-2">
 							<div class="w-full">
