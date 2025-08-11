@@ -183,7 +183,7 @@ export const getVoices = async (token: string = '') => {
 		})
 		.catch((err) => {
 			error = err.detail;
-			console.error(err);
+			console.log(err);
 
 			return null;
 		});

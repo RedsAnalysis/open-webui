@@ -51,6 +51,8 @@ from open_webui.env import (
     ENABLE_FORWARD_USER_INFO_HEADERS,
 )
 
+import httpx
+from typing import List, Dict, Any
 
 router = APIRouter()
 
@@ -154,6 +156,8 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
 class TTSConfigForm(BaseModel):
     OPENAI_API_BASE_URL: str
     OPENAI_API_KEY: str
+    CUSTOM_TTS_OPEN_API_BASE_URL: str
+    CUSTOM_TTS_OPEN_API_KEY: str
     API_KEY: str
     ENGINE: str
     MODEL: str
@@ -190,6 +194,8 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
         "tts": {
             "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
+            "CUSTOM_TTS_OPEN_API_BASE_URL": request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL,
+            "CUSTOM_TTS_OPEN_API_KEY": request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY,
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
@@ -222,6 +228,8 @@ async def update_audio_config(
 ):
     request.app.state.config.TTS_OPENAI_API_BASE_URL = form_data.tts.OPENAI_API_BASE_URL
     request.app.state.config.TTS_OPENAI_API_KEY = form_data.tts.OPENAI_API_KEY
+    request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL = form_data.tts.CUSTOM_TTS_OPEN_API_BASE_URL
+    request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY = form_data.tts.CUSTOM_TTS_OPEN_API_KEY
     request.app.state.config.TTS_API_KEY = form_data.tts.API_KEY
     request.app.state.config.TTS_ENGINE = form_data.tts.ENGINE
     request.app.state.config.TTS_MODEL = form_data.tts.MODEL
@@ -264,6 +272,8 @@ async def update_audio_config(
         "tts": {
             "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
+            "CUSTOM_TTS_OPEN_API_BASE_URL": request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL,
+            "CUSTOM_TTS_OPEN_API_KEY" : request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY,
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
@@ -387,6 +397,67 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             raise HTTPException(
                 status_code=status_code,
                 detail=detail,
+            )
+
+    if request.app.state.config.TTS_ENGINE == "customtts":
+        payload["model"] = request.app.state.config.TTS_MODEL
+        r = None
+        try:
+            timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=True
+            ) as session:
+                async with session.post(
+                    url=f"{request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL}/audio/speech",
+                    json=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY}",
+                        **(
+                            {
+                                "X-OpenWebUI-User-Name": user.name,
+                                "X-OpenWebUI-User-Id": user.id,
+                                "X-OpenWebUI-User-Email": user.email,
+                                "X-OpenWebUI-User-Role": user.role,
+                            }
+                            if ENABLE_FORWARD_USER_INFO_HEADERS
+                            else {}
+                        ),
+                    },
+                ) as r:
+                    r.raise_for_status()
+
+                    async with aiofiles.open(file_path, "wb") as f:
+                        await f.write(await r.read())
+
+                    async with aiofiles.open(file_body_path, "w") as f:
+                        await f.write(json.dumps(payload))
+
+            return FileResponse(file_path)
+
+        except Exception as e:
+            log.exception(e)
+            detail = None
+
+            try:
+                if r is not None and r.status != 200:
+                    try:
+                        res = await r.json()
+                        if "error" in res:
+                            detail = f"External: {res['error'].get('message', '')}"
+                        else:
+                            detail = f"External Error: {await r.text()}"
+                    except Exception:
+                        detail = f"External Error: Status {r.status}"
+                elif detail is None:
+                    detail = f"Error during request: {e}"
+            except Exception as detail_err:
+                log.error(f"Error extracting error detail: {detail_err}")
+                detail = f"Error during request: {e}" # Fallback
+
+            raise HTTPException(
+                status_code=getattr(r, "status", 500) if r else 500,
+                detail=detail if detail else "Open WebUI: Server Connection Error",
             )
 
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
@@ -1011,6 +1082,58 @@ def get_available_models(request: Request) -> list[dict]:
                 available_models = [{"id": "tts-1"}, {"id": "tts-1-hd"}]
         else:
             available_models = [{"id": "tts-1"}, {"id": "tts-1-hd"}]
+    
+    elif request.app.state.config.TTS_ENGINE == "customtts":
+        log.debug("Fetching models for CustomTTS engine")
+        # Get the correct configuration variables
+        custom_tts_base_url = request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL
+        custom_tts_key = request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY
+
+        if not custom_tts_base_url:
+            log.warning("Custom TTS Base URL not configured for fetching models.")
+        else:
+            # Construct the target URL based on the curl example (/models)
+            target_url = f"{custom_tts_base_url.rstrip('/')}/models"
+            headers = {
+                "Accept": "application/json",
+            }
+            # Add Authorization header if a key is provided (adjust type if needed, e.g., Bearer)
+            if custom_tts_key:
+                headers["Authorization"] = f"Bearer {custom_tts_key}" # Example: Bearer token
+
+            try:
+                log.info(f"Attempting to fetch models from custom URL: {target_url}")
+                response = requests.get(target_url, headers=headers, timeout=10)
+                response.raise_for_status() # Check for HTTP errors
+                external_data = response.json()
+
+                # Extract list from the 'data' key based on curl response
+                if isinstance(external_data, dict) and "data" in external_data:
+                    models_list = external_data["data"]
+                    if isinstance(models_list, list):
+                        # Transform list of dicts to ensure 'id' and 'name'
+                        transformed_models = []
+                        for model_data in models_list:
+                            if isinstance(model_data, dict) and "id" in model_data:
+                                model_id = model_data["id"]
+                                # Use 'name' if available, otherwise default to 'id'
+                                model_name = model_data.get("name", model_id)
+                                transformed_models.append({"id": model_id, "name": model_name})
+                        available_models = transformed_models
+                    else:
+                        log.warning(f"'data' key in response from {target_url} is not a list.")
+                else:
+                    log.warning(f"Unexpected response format from {target_url}. Expected dict with 'data' key.")
+
+            except requests.exceptions.RequestException as e:
+                log.error(f"Network error fetching models from custom TTS ({target_url}): {str(e)}")
+            except Exception as e: # Catch other errors like JSONDecodeError
+                 log.error(f"Unexpected error fetching models from custom TTS ({target_url}): {str(e)}")
+            # If any error occurs, available_models remains []
+
+    # --- END ADDED BLOCK ---
+
+
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
         try:
             response = requests.get(
@@ -1072,6 +1195,48 @@ def get_available_voices(request) -> dict:
                 "nova": "nova",
                 "shimmer": "shimmer",
             }
+    elif request.app.state.config.TTS_ENGINE == "customtts":
+        custom_tts_base_url = request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_BASE_URL
+        custom_tts_key = request.app.state.config.AUDIO_TTS_CUSTOM_TTS_OPEN_API_KEY
+
+        if not custom_tts_base_url:
+            log.warning("Custom TTS Base URL not configured. Cannot fetch voices.")
+        else:
+            target_url = f"{custom_tts_base_url.rstrip('/')}/audio/voices"
+            headers = {"Accept": "application/json"}
+            if custom_tts_key:
+                # Assuming Bearer token auth, adjust if your custom service uses something else (e.g., X-Api-Key)
+                headers["Authorization"] = f"Bearer {custom_tts_key}"
+
+            try:
+                log.info(f"Attempting to fetch voices from custom TTS URL: {target_url}")
+                response = requests.get(target_url, headers=headers, timeout=10) # Added timeout
+                response.raise_for_status() # Check for HTTP errors (4xx, 5xx)
+                external_data = response.json()
+
+                # Assuming the external service returns {"voices": ["voice1", "voice2", ...]}
+                # Adjust the parsing logic if your custom service returns a different structure
+                if isinstance(external_data, dict) and "voices" in external_data:
+                    voice_list = external_data["voices"]
+                    if isinstance(voice_list, list):
+                        # Transform list of strings into {id: name} format
+                        available_voices = {
+                            voice_name: voice_name
+                            for voice_name in voice_list if isinstance(voice_name, str)
+                        }
+                    else:
+                         log.warning(f"'voices' key in response from {target_url} is not a list.")
+                else:
+                    log.warning(f"Unexpected response format from {target_url}. Expected dict with 'voices' key.")
+
+            except requests.exceptions.RequestException as e:
+                 log.error(f"Network error fetching voices from custom TTS ({target_url}): {str(e)}")
+                 # available_voices remains empty
+            except Exception as e: # Catch other errors like JSONDecodeError, processing errors
+                 log.error(f"Unexpected error fetching or processing voices from custom TTS ({target_url}): {str(e)}")
+                 # available_voices remains empty
+
+
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
         try:
             available_voices = get_elevenlabs_voices(
